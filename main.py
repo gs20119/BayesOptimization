@@ -9,6 +9,8 @@ from matplotlib import pyplot as plt, figure, animation
 import numpy as np
 import matplotlib as mpl
 from numpy.random import randint
+import scipy
+from scipy.stats import norm
 
 mpl.use('Agg')
 plt.rcParams["font.family"] = "Times New Roman"
@@ -45,12 +47,19 @@ class Game(Tk):
         self.create_frame(Player)
 
     def defineFunction(self):
-        x = np.linspace(0,20,1000)
-        y = -0.05*((x-10)**2)+2.5
+        x = np.expand_dims(np.linspace(0,20,1000),1)
+        cov = 3.5*self.kernel_RBF(x,x) # Exponential Gaussian Kernel
+        y = np.random.multivariate_normal(
+            mean=np.zeros(1000), cov=cov, size=1
+        ).squeeze()
         return y
 
     def check_result(self):
         self.create_frame(ResultPage)
+
+    def kernel_RBF(self, xa, xb):
+        sqnorm = -0.5*scipy.spatial.distance.cdist(xa, xb, 'sqeuclidean')
+        return np.exp(sqnorm)
 
 
 class StartPage(Frame):
@@ -84,7 +93,6 @@ class StartPage(Frame):
         self.subtitle.set_alpha(self.alpha)
 
         self.canvas = FigureCanvasTkAgg(self.fig, master=self.root) # connect tkinter canvas with pyplot figure
-        self.canvas.mpl_connect("button_press_event", lambda e : self.fadeout()) # listener of canvas
         self.anim = animation.FuncAnimation(self.fig, self.animate, init_func=self.init, frames=1000, interval=20, blit=True)
 
     def fadein(self):
@@ -95,6 +103,8 @@ class StartPage(Frame):
             self.title.set_alpha(self.alpha)
             self.subtitle.set_alpha(self.alpha)
             self.after(50, self.fadein)
+        else:
+            self.canvas.mpl_connect("button_press_event", lambda e : self.fadeout()) # listener of canvas
 
     def fadeout(self):
         self.canvas.mpl_disconnect("button_press_event")
@@ -113,7 +123,7 @@ class StartPage(Frame):
         return self.line, self.title, self.subtitle
 
     def animate(self, i):
-        x = np.linspace(0, 10, 1000)
+        x = np.linspace(0, 20, 1000)
         y = (2.3*np.sin(12*(x+0.001*i))+1.4*np.cos(5*(x+0.004*i))+0.7*np.sin(16*(x+0.003*i)))/3
         self.line.set_data(x, y)
         return self.line, self.title, self.subtitle
@@ -147,9 +157,6 @@ class Player(Frame):
         self.canvas = FigureCanvasTkAgg(self.fig, master=self.root)
         self.canvas.get_tk_widget().pack(side=tkinter.TOP, fill=tkinter.BOTH, expand=True)
         self.anim = animation.FuncAnimation(self.fig, self.animate, init_func=self.init, frames=1000, interval=20, blit=True)
-
-    def __del__(self):
-        print("I am dying")
 
     def track(self, event):
         self.x = event.x
@@ -207,11 +214,10 @@ class Machine(Frame):
         Frame.__init__(self, parent)
         self.root = root
         self.func = []
-        self.predict = []
+        self.predict, self.uncertain = [], []
         self.entries = []
         self.alpha = 0.0
-        self.x = 500
-        self.i = 0
+        self.x, self.i = 500, 0
 
         self.fig = plt.Figure(figsize=(16.8,7.2), dpi=100)
         self.fig.patch.set_facecolor('black')
@@ -221,6 +227,10 @@ class Machine(Frame):
         self.ax.get_yaxis().set_visible(False)
         self.ax.set_facecolor('black')
         self.ax.set_position([0, 0, 1, 1])
+
+        self.prdLine, = self.ax.plot([], [], color='white', ls='--')
+        self.prdHigh, = self.ax.plot([], [], color='white')
+        self.prdLow, = self.ax.plot([], [], color='white')
 
         self.guide, = self.ax.plot([], [], lw=2, ls='--') # include line in graph
         self.guide.set_color('yellow')
@@ -240,12 +250,32 @@ class Machine(Frame):
             self.after(50, self.fadein)
         else:
             self.func = self.root.function
-            self.entries = self.bayesOptim()
-            self.x, self.i = 500, 0
+            self.entries = [500]
+            self.x, self.i = 200, 0
 
-    def bayesOptim(self):
-        results = [50+i for i in range(20)]
-        return results
+    def bayesOptim(self): # add entries
+        x = np.array([0.02*i for i in self.entries]).reshape(-1,1)
+        y = np.array([self.func[i] for i in self.entries]).reshape(-1,1)
+        X = np.linspace(0,20,1000).reshape(-1,1)
+        mean, cov = self.GaussianProcess(x, y, X, self.root.kernel_RBF)
+        std = np.sqrt(np.diag(cov)).reshape(-1,1)
+        eps = 0.01
+        max_curr = np.max(y)
+        imp = mean-max_curr-eps
+        Z = imp / (std+0.001)
+        EI = imp * norm.cdf(Z) + std * norm.pdf(Z) # Acquisition : Expected Improvement
+        EI[std==0.0] = 0.0
+        self.entries.append(np.argmax(EI))
+        self.predict = mean.flatten()
+        self.uncertain = std.flatten()
+
+    def GaussianProcess(self, x, y, X, kernel): # given x and y(x), predict all y(X)
+        cov11 = kernel(x,x)
+        cov12 = kernel(x,X)
+        cov22 = kernel(X,X)
+        solved = scipy.linalg.solve(cov11, cov12, assume_a='pos').T # inv(cov11)*(cov12)
+        mean, cov = solved @ y, cov22 - (solved @ cov12)
+        return mean, cov
 
     def fadeout(self):
         if self.alpha > 0:
@@ -257,34 +287,38 @@ class Machine(Frame):
             self.root.machineRecords = self.entries.copy()
             self.root.check_result()
             self.canvas.get_tk_widget().pack_forget()
-            self.guide  = None
+            self.guide = None
             self.grid_forget()
             self.destroy()
 
     def init(self):
-        return self.guide, self.candidates,
+        return self.guide, self.candidates, self.prdLine, self.prdHigh, self.prdLow
 
     def animate(self, i):
-        x = [self.x/50, self.x/50]
-        y = [-5, 5]
-        self.guide.set_data(x, y)
-        if len(self.entries) != 0: self.move()
-        if self.i != 0:
+        guidex = [self.x/50, self.x/50]
+        guidey = [-5, 5]
+        self.guide.set_data(guidex, guidey)
+        if self.i == len(self.entries): # when moving is finished
+            if self.i < 20: self.bayesOptim() # add next entry
             X = np.array([0.02*i for i in self.entries[:self.i]])
             Y = np.array([self.func[i] for i in self.entries[:self.i]])
             scale = (Y+4.0)/8.0
             self.candidates.set_offsets(np.vstack((X,Y)).T)
-            self.candidates.set_edgecolors(plt.cm.coolwarm(scale))
-        return self.guide, self.candidates,
+            self.candidates.set_facecolors(plt.cm.coolwarm(scale))
+            x = np.linspace(0, 20, 1000)
+            self.prdHigh.set_data(x, self.predict-self.uncertain)
+            self.prdLow.set_data(x, self.predict+self.uncertain)
+            self.prdLine.set_data(x, self.predict)
+        elif len(self.entries) != 0: self.move(self.entries[-1]) # needs to move
+        return self.guide, self.candidates, self.prdLine, self.prdHigh, self.prdLow
 
-    def move(self):
-        if self.i == 20: return
-        if self.x > self.entries[self.i]+150: self.x -= 10
-        elif self.x > self.entries[self.i]+50: self.x -= 6
-        elif self.x > self.entries[self.i]+1: self.x -= 3
-        elif self.x < self.entries[self.i]-150: self.x += 10
-        elif self.x < self.entries[self.i]-50: self.x += 6
-        elif self.x < self.entries[self.i]-1: self.x += 3
+    def move(self, dir):
+        if self.x > self.entries[-1]+150: self.x -= 10
+        elif self.x > self.entries[-1]+50: self.x -= 6
+        elif self.x > self.entries[-1]+1: self.x -= 3
+        elif self.x < self.entries[-1]-150: self.x += 10
+        elif self.x < self.entries[-1]-50: self.x += 6
+        elif self.x < self.entries[-1]-1: self.x += 3
         else: self.i += 1
         if self.i == 20: self.fadeout()
 
@@ -318,7 +352,7 @@ class ResultPage(Frame):
         self.title.set_verticalalignment('center')
         self.title.set_alpha(self.alpha)
 
-        self.subtitle = self.ax.text(10, 5.5, "Click Anywhere to Retry", fontsize=30, color='white')
+        self.subtitle = self.ax.text(10, 5, "Click Anywhere to Retry", fontsize=30, color='white')
         self.subtitle.set_horizontalalignment('center')
         self.subtitle.set_verticalalignment('center')
         self.subtitle.set_alpha(self.alpha)
